@@ -2,7 +2,11 @@ from typing import Any, Dict, List, Tuple
 import json
 from src.converter.utils import extract_content_and_reasoning
 from log import log
-from src.converter.openai2gemini import _convert_usage_metadata
+from src.converter.openai2gemini import _convert_usage_metadata, extract_tool_calls_from_parts
+
+# ... (keep existing imports)
+
+# ... (keep existing imports)
 
 def safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
     """安全获取嵌套字典值
@@ -24,13 +28,13 @@ def safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
     return obj
 
 def parse_response_for_fake_stream(response_data: Dict[str, Any]) -> tuple:
-    """从完整响应中提取内容和推理内容(用于假流式)
+    """从完整响应中提取内容、推理内容和工具调用(用于假流式)
 
     Args:
         response_data: Gemini API 响应数据
 
     Returns:
-        (content, reasoning_content, finish_reason, images): 内容、推理内容、结束原因和图片数据的元组
+        (content, reasoning_content, finish_reason, images, tool_calls): 元组
     """
     import json
 
@@ -42,18 +46,23 @@ def parse_response_for_fake_stream(response_data: Dict[str, Any]) -> tuple:
     candidates = response_data.get("candidates", [])
     log.debug(f"[FAKE_STREAM] Found {len(candidates)} candidates")
     if not candidates:
-        return "", "", "STOP", []
+        return "", "", "STOP", [], []
 
     candidate = candidates[0]
     finish_reason = candidate.get("finishReason", "STOP")
     parts = safe_get_nested(candidate, "content", "parts", default=[])
     log.debug(f"[FAKE_STREAM] Extracted {len(parts)} parts: {json.dumps(parts, ensure_ascii=False)}")
     content, reasoning_content, images = extract_content_and_reasoning(parts)
-    log.debug(f"[FAKE_STREAM] Content length: {len(content)}, Reasoning length: {len(reasoning_content)}, Images count: {len(images)}")
+    
+    # 提取工具调用
+    # is_streaming=True 会给每个 tool_call 添加 index 字段，这对流式响应很重要
+    tool_calls, _ = extract_tool_calls_from_parts(parts, is_streaming=True)
+    
+    log.debug(f"[FAKE_STREAM] Content length: {len(content)}, Reasoning length: {len(reasoning_content)}, Images count: {len(images)}, Tool calls: {len(tool_calls)}")
 
-    return content, reasoning_content, finish_reason, images
+    return content, reasoning_content, finish_reason, images, tool_calls
 
-def extract_fake_stream_content(response: Any) -> Tuple[str, str, Dict[str, int]]:
+def extract_fake_stream_content(response: Any) -> Tuple[str, str, Dict[str, int], List[Dict[str, Any]]]:
     """
     从 Gemini 非流式响应中提取内容，用于假流式处理
     
@@ -61,7 +70,7 @@ def extract_fake_stream_content(response: Any) -> Tuple[str, str, Dict[str, int]
         response: Gemini API 响应对象
     
     Returns:
-        (content, reasoning_content, usage) 元组
+        (content, reasoning_content, usage, tool_calls) 元组
     """
     from src.converter.utils import extract_content_and_reasoning
     
@@ -95,34 +104,40 @@ def extract_fake_stream_content(response: Any) -> Tuple[str, str, Dict[str, int]
         content = ""
         reasoning_content = ""
         images = []
+        tool_calls = []
+        
         if "candidates" in gemini_response and gemini_response["candidates"]:
             # Gemini格式响应 - 使用思维链分离
             candidate = gemini_response["candidates"][0]
             if "content" in candidate and "parts" in candidate["content"]:
                 parts = candidate["content"]["parts"]
                 content, reasoning_content, images = extract_content_and_reasoning(parts)
+                # 提取工具调用
+                tool_calls, _ = extract_tool_calls_from_parts(parts, is_streaming=True)
         elif "choices" in gemini_response and gemini_response["choices"]:
             # OpenAI格式响应
             content = gemini_response["choices"][0].get("message", {}).get("content", "")
+            # OpenAI格式暂不需额外处理工具调用，因为通常来自Gemini格式
 
         # 如果没有正常内容但有思维内容，给出警告
-        if not content and reasoning_content:
+        if not content and reasoning_content and not tool_calls:
             log.warning("Fake stream response contains only thinking content")
             content = "[模型正在思考中，请稍后再试或重新提问]"
         
-        # 如果完全没有内容，提供默认回复
-        if not content:
+        # 如果完全没有内容也没有工具调用，提供默认回复
+        if not content and not tool_calls:
             log.warning(f"No content found in response: {gemini_response}")
             content = "[响应为空，请重新尝试]"
 
         # 转换usageMetadata为OpenAI格式
         usage = _convert_usage_metadata(gemini_response.get("usageMetadata"))
         
-        return content, reasoning_content, usage
+        return content, reasoning_content, usage, tool_calls
 
     except json.JSONDecodeError:
         # 如果不是JSON，直接返回原始文本
-        return body_str, "", None
+        return body_str, "", None, []
+
 
 def _build_candidate(parts: List[Dict[str, Any]], finish_reason: str = "STOP") -> Dict[str, Any]:
     """构建标准候选响应结构
@@ -238,43 +253,100 @@ def create_gemini_heartbeat_chunk() -> Dict[str, Any]:
     chunk["candidates"][0]["finishReason"] = None
     return chunk
 
-
-def build_openai_fake_stream_chunks(content: str, reasoning_content: str, finish_reason: str, model: str, images: List[Dict[str, Any]] = None, chunk_size: int = 50) -> List[Dict[str, Any]]:
+def build_openai_fake_stream_chunks(content: str, reasoning_content: str, finish_reason: str, model: str, images: List[Dict[str, Any]] = None, chunk_size: int = 50, tool_calls: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """构建 OpenAI 格式的假流式响应数据块
-
+    
     Args:
         content: 主要内容
         reasoning_content: 推理内容
-        finish_reason: 结束原因（如 "STOP", "MAX_TOKENS"）
+        finish_reason: 结束原因
         model: 模型名称
-        images: 图片数据列表（可选）
-        chunk_size: 每个chunk的字符数（默认50）
-
-    Returns:
-        OpenAI 格式的响应数据块列表
+        images: 图片数据
+        chunk_size: 大小
+        tool_calls: 工具调用列表
     """
     import time
     import uuid
 
     if images is None:
         images = []
+    if tool_calls is None:
+        tool_calls = []
 
-    log.debug(f"[build_openai_fake_stream_chunks] Input - content: {repr(content)}, reasoning: {repr(reasoning_content)}, finish_reason: {finish_reason}, images count: {len(images)}")
+    log.debug(f"[build_openai_fake_stream_chunks] Input - content: {len(content)} chars, reasoning: {len(reasoning_content)} chars, finish_reason: {finish_reason}, images: {len(images)}, tool_calls: {len(tool_calls)}")
     chunks = []
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     # 映射 Gemini finish_reason 到 OpenAI 格式
     openai_finish_reason = None
-    if finish_reason == "STOP":
+    if tool_calls:
+        openai_finish_reason = "tool_calls"
+    elif finish_reason == "STOP":
         openai_finish_reason = "stop"
     elif finish_reason == "MAX_TOKENS":
         openai_finish_reason = "length"
     elif finish_reason in ["SAFETY", "RECITATION"]:
         openai_finish_reason = "content_filter"
 
-    # 如果没有正常内容但有思维内容，提供默认回复
-    if not content:
+    # 1. 处理工具调用
+    if tool_calls:
+        for tc in tool_calls:
+            index = tc.get("index", 0)
+            func = tc.get("function", {})
+            
+            # 第一帧：ID, Type, Name
+            delta_header = {
+                "tool_calls": [{
+                    "index": index,
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": func.get("name"),
+                        "arguments": ""
+                    }
+                }]
+            }
+            chunks.append({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta_header,
+                    "finish_reason": None
+                }]
+            })
+            
+            # 第二帧：Arguments (一次性发送)
+            delta_args = {
+                "tool_calls": [{
+                    "index": index,
+                    "function": {
+                        "arguments": func.get("arguments", "{}")
+                    }
+                }]
+            }
+            chunks.append({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta_args,
+                    "finish_reason": None # 最后一个tool call结束时才设置finish_reason? OpenAI通常是流式
+                }]
+            })
+            
+        # 如果只有工具调用没有内容，发送结束帧
+        if not content and not reasoning_content:
+             chunks[-1]["choices"][0]["finish_reason"] = openai_finish_reason
+             return chunks
+
+    # 如果没有正常内容但有思维内容，提供默认回复 (仅当没有工具调用时)
+    if not content and not tool_calls:
         default_text = "[模型正在思考中，请稍后再试或重新提问]" if reasoning_content else "[响应为空，请重新尝试]"
         return [{
             "id": response_id,
@@ -288,21 +360,21 @@ def build_openai_fake_stream_chunks(content: str, reasoning_content: str, finish
             }]
         }]
 
-    # 分块发送主要内容
+    # 分块发送主要内容 (同前)
+    # ... (content handling)
     first_chunk = True
     for i in range(0, len(content), chunk_size):
         chunk_text = content[i:i + chunk_size]
         is_last_chunk = (i + chunk_size >= len(content)) and not reasoning_content
+        # 如果有工具调用，文本结束不一定是整个response结束
         chunk_finish = openai_finish_reason if is_last_chunk else None
 
         delta_content = {}
-
-        # 如果是第一个chunk且有图片，构建包含图片的content数组
         if first_chunk and images:
-            delta_content["content"] = images + [{"type": "text", "text": chunk_text}]
-            first_chunk = False
+             delta_content["content"] = images + [{"type": "text", "text": chunk_text}]
+             first_chunk = False
         else:
-            delta_content["content"] = chunk_text
+             delta_content["content"] = chunk_text
 
         chunk_data = {
             "id": response_id,
@@ -315,10 +387,9 @@ def build_openai_fake_stream_chunks(content: str, reasoning_content: str, finish
                 "finish_reason": chunk_finish,
             }]
         }
-        log.debug(f"[build_openai_fake_stream_chunks] Generated chunk: {chunk_data}")
         chunks.append(chunk_data)
 
-    # 如果有推理内容，分块发送（使用 reasoning_content 字段）
+    # ... (reasoning handling)
     if reasoning_content:
         for i in range(0, len(reasoning_content), chunk_size):
             chunk_text = reasoning_content[i:i + chunk_size]
@@ -337,7 +408,6 @@ def build_openai_fake_stream_chunks(content: str, reasoning_content: str, finish
                 }]
             })
 
-    log.debug(f"[build_openai_fake_stream_chunks] Total chunks generated: {len(chunks)}")
     return chunks
 
 

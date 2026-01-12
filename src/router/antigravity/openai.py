@@ -241,14 +241,15 @@ async def chat_completions(
                 return
 
             # 使用统一的解析函数
-            content, reasoning_content, finish_reason, images = parse_response_for_fake_stream(gemini_response)
+            content, reasoning_content, finish_reason, images, tool_calls = parse_response_for_fake_stream(gemini_response)
 
             log.debug(f"OpenAI extracted content: {content}")
             log.debug(f"OpenAI extracted reasoning: {reasoning_content[:100] if reasoning_content else 'None'}...")
             log.debug(f"OpenAI extracted images count: {len(images)}")
+            log.debug(f"OpenAI extracted tool calls count: {len(tool_calls)}")
 
             # 构建响应块
-            chunks = build_openai_fake_stream_chunks(content, reasoning_content, finish_reason, real_model, images)
+            chunks = build_openai_fake_stream_chunks(content, reasoning_content, finish_reason, real_model, images, tool_calls=tool_calls)
             for idx, chunk in enumerate(chunks):
                 chunk_json = json.dumps(chunk)
                 log.debug(f"[FAKE_STREAM] Yielding chunk #{idx+1}: {chunk_json[:200]}")
