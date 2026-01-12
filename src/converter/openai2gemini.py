@@ -614,17 +614,19 @@ def _reverse_transform_value(value: Any) -> Any:
     if value == 'null':
         return None
     
-    # 数字（确保字符串确实是纯数字）
-    if value.strip() and not value.startswith('0') and value.replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).isdigit():
-        try:
-            # 尝试转换为数字
-            num_value = float(value)
-            # 如果是整数，返回 int
-            if num_value == int(num_value):
-                return int(num_value)
-            return num_value
-        except ValueError:
-            pass
+    # 数字转换逻辑太激进，可能会破坏原本应该是字符串的参数（如 "1.0", "2024" 等）
+    # Gemini (REST API) 通常会返回正确的类型，即使是字符串也不建议盲目转数字
+    # 除非 schema 明确，否则保持原样更安全
+    # if value.strip() and not value.startswith('0') and value.replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).isdigit():
+    #     try:
+    #         # 尝试转换为数字
+    #         num_value = float(value)
+    #         # 如果是整数，返回 int
+    #         if num_value == int(num_value):
+    #             return int(num_value)
+    #         return num_value
+    #     except ValueError:
+    #         pass
     
     # 其他情况保持字符串
     return value
