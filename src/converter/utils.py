@@ -19,6 +19,8 @@ def extract_content_and_reasoning(parts: list) -> tuple:
               }
           }
     """
+    import re
+
     content = ""
     reasoning_content = ""
     images = []
@@ -30,7 +32,19 @@ def extract_content_and_reasoning(parts: list) -> tuple:
             if part.get("thought", False):
                 reasoning_content += text
             else:
-                content += text
+                # 尝试检测隐式的思考内容 (针对 Gemini 2.0 Flash Thinking 等模型)
+                # 1. 检测 <thought> 标签
+                thought_match = re.search(r'<thought>(.*?)</thought>', text, re.DOTALL)
+                if thought_match:
+                    thought_text = thought_match.group(1).strip()
+                    if thought_text:
+                        reasoning_content += thought_text
+                    # 从正文中移除思考块
+                    text = re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL).strip()
+                
+                # 2. 如果正文非空，则通过
+                if text:
+                    content += text
 
         # 提取图片数据
         if "inlineData" in part:
